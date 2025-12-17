@@ -17,6 +17,32 @@ def compute_cider(
 
     return coco_eval.eval
 
+def compute_cider_all_scores(
+    result_path,
+    annotations_path,
+    return_img_ids=False,
+):
+    # create coco object and coco_result object
+    coco = COCO(annotations_path)
+    coco_result = coco.loadRes(result_path)
+
+    cider_scorer = Cider()
+    imgIds = coco_result.getImgIds()
+    gts = {}
+    res = {}
+    for imgId in imgIds:
+        gts[imgId] = coco.imgToAnns[imgId]
+        res[imgId] = coco_result.imgToAnns[imgId]
+    tokenizer = PTBTokenizer()
+    gts = tokenizer.tokenize(gts)
+    res = tokenizer.tokenize(res)
+    score, scores = cider_scorer.compute_score(gts, res)
+    scores *= 100
+    if return_img_ids:
+        return scores, imgIds
+    else:
+        return scores
+
 
 def postprocess_captioning_generation(predictions):
     return predictions.split("Output", 1)[0]

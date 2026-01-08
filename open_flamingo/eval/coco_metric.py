@@ -45,4 +45,4 @@ def compute_cider_all_scores(
 
 
 def postprocess_captioning_generation(predictions):
-    return predictions.split("Output", 1)[0]
+    return predictions.split("Output", 1)[0].replace("assistant", "").strip()

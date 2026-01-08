@@ -53,25 +53,28 @@ class EvalModelLLAVA(BaseEvalModel):
             )  # we need to normalize in the forward pass, so that the threat model is consistent
         model_args["temperature"] = float(model_args["temperature"])
         model_args["num_beams"] = int(model_args["num_beams"])
-        self.model_args = model_args
 
-        # determine conversation mode
-        self.conv_mode = model_args.get("conv_mode", None)
-        if self.conv_mode is None:
-            if "llama-2" in model_name.lower():
-                conv_mode = "llava_llama_2"
+        if model_args.get("conv_mode", "auto") == "auto":
+            if "llama3" in model_name.lower():
+                conv_mode = "llava_llama_3"
+            elif "qwen25" in model_name.lower():
+                conv_mode = "qwen_2_5"
             elif "apertus" in model_name.lower():
-                conv_mode = "apertus_instruct"
+                conv_mode = "apertus_ori"
+            elif "llama-2" in model_name.lower():
+                conv_mode = "llava_llama_2"
             elif "v1" in model_name.lower():
                 conv_mode = "llava_v1"
             elif "mpt" in model_name.lower():
                 conv_mode = "mpt"
             else:
                 conv_mode = "llava_v0"
+                print(f"[info] Unknown model_name: {model_name}, using conv_mode={conv_mode}")
+            model_args["conv_mode"] = conv_mode
 
-        print(f"Using conversation mode: {self.conv_mode}")
-
-
+        self.model_args = model_args
+        self.conv_mode = model_args["conv_mode"]
+        self.text_only = model_args.get("text_only", False)
         if model_args["precision"] == "float16":
             self.cast_dtype = torch.float16
         elif model_args["precision"] == "float32":
@@ -85,6 +88,10 @@ class EvalModelLLAVA(BaseEvalModel):
 
         self.stop_str = conv_templates[self.conv_mode].sep if conv_templates[self.conv_mode].sep_style != SeparatorStyle.TWO else conv_templates[self.conv_mode].sep2
         self.stop_token_id = self.tokenizer.convert_tokens_to_ids(self.stop_str)
+        self.apply_gaussian_noise = model_args.get("apply_gaussian_noise", False)
+        self.gaussian_noise_sigma = model_args.get("gaussian_noise_sigma", 0.1)
+        self.apply_uniform_noise = model_args.get("apply_uniform_noise", False)
+        self.uniform_noise_eps = model_args.get("uniform_noise_eps", 4)
 
     @torch.no_grad()
     def get_outputs(
@@ -93,16 +100,84 @@ class EvalModelLLAVA(BaseEvalModel):
         batch_images: torch.Tensor,
         min_generation_length: int,
         max_generation_length: int,
+        use_cache: bool = False,
+        image_id: str = None,
+        save_llm_features: str = None,
         **kwargs,
     ) -> List[str]:
         assert len(batch_text) == 1, "Only support batch size 1 (yet)"
         assert 0. <= batch_images.min() and batch_images.max() <= 1., "Images must be in image space"
 
-        #prompt = batch_text.get_prompt()
-        print(f"DEBUG (get_outputs): Input prompt: '{batch_text[0].get_prompt()}'")
-        input_ids = self._prepare_text(batch_text)
 
-        batch_images = self.normalizer(batch_images)
+        # ===== Apply noise BEFORE normalization =====
+        if self.apply_uniform_noise:
+            noise = torch.empty_like(batch_images).uniform_(
+                -self.uniform_noise_eps / 255.0, self.uniform_noise_eps / 255.0
+            )
+            batch_images = batch_images + noise
+            batch_images = torch.clamp(batch_images, 0.0, 1.0)
+
+        elif self.apply_gaussian_noise:
+            noise = torch.randn_like(batch_images) * self.gaussian_noise_sigma
+            batch_images = batch_images + noise
+            batch_images = torch.clamp(batch_images, 0.0, 1.0)
+        else:
+            pass
+        # ===========================================
+        if self.text_only:
+            # Create black images with same shape & device as batch_images
+            batch_images = torch.zeros_like(batch_images)
+            print("Using Black Images for text-only generation.")
+
+        else:
+            batch_images = self.normalizer(batch_images)
+
+        # ---- NEW: optional hidden-state dump (prefill) ----
+        if save_llm_features:
+            try:
+                self.set_inputs(save_llm_features["batch_text_adv"])
+                image_token_idx = (self.input_ids == -200).nonzero(as_tuple=True)[1].item()
+                prefill = self.model(
+                    input_ids=self.input_ids,
+                    attention_mask=self.attention_mask,
+                    images=batch_images.to(dtype=self.cast_dtype, device='cuda', non_blocking=True),
+                    return_dict=True,
+                    output_hidden_states=True,
+                    output_attentions=True,
+                    use_cache=False,
+                )
+                # --- Hidden states ---
+                hs = prefill.hidden_states  # tuple: (embeds, layer1, ..., layerN)
+                per_sample_hs = [t[0].cpu().to(torch.float16) for t in hs]  # B=1
+
+                # --- Attentions ---
+                att = prefill.attentions if hasattr(prefill, "attentions") and prefill.attentions is not None else []
+                per_sample_att = [a[0].cpu().to(torch.float16) for a in att]  # each: (num_heads, seq, seq)
+
+                payload = {
+                    "layers": len(per_sample_hs) - 1,
+                    "hidden_state_shapes": [tuple(x.shape) for x in per_sample_hs],
+                    "attention_shapes": [tuple(x.shape) for x in per_sample_att],
+                    "hidden_states": per_sample_hs,
+                    "attentions": per_sample_att,
+                    "tag": "llm_prefill",
+                    "image_token_idx": image_token_idx,
+                    "full_input_ids": self.input_ids.cpu().tolist()[0],
+                    "input_ids_after_image_token": self.input_ids.cpu().tolist()[0][image_token_idx+1:],
+                    "batch_text_adv": save_llm_features["batch_text_adv"],
+                }
+
+                out_dir = os.path.join(save_llm_features["save_dest"], "features-llm")
+                os.makedirs(out_dir, exist_ok=True)
+                print(f"[info] saving LLM hidden states of {save_llm_features['image_id']} with image token index {image_token_idx}")
+                fname = f"{str(save_llm_features['image_id'])}.pt"
+                torch.save(payload, os.path.join(out_dir, fname))
+            except Exception as e:
+                print(f"[warn] saving LLM hidden states failed: {e}")
+        # ----------------------------------------------------
+        prompt = batch_text[0].get_prompt() if isinstance(batch_text, list) else batch_text.get_prompt()
+        print(f"[debug] Prompt: {prompt}")
+        input_ids = self._prepare_text(batch_text)
         image_sizes = [(batch_images.shape[-1], batch_images.shape[-2]) for _ in range(batch_images.shape[0])]
         output_ids = self.model.generate(
             input_ids,
@@ -114,23 +189,22 @@ class EvalModelLLAVA(BaseEvalModel):
             num_beams=self.model_args["num_beams"],
             min_new_tokens=min_generation_length,
             max_new_tokens=max_generation_length,
-            use_cache=False
+            use_cache=use_cache,
+            # image_id=image_id,
         )
 
-        # print(f"DEBUG (get_outputs): output_ids.shape: {output_ids.shape}, output_ids: {output_ids}")
         input_token_len = input_ids.shape[1]
         # n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
         # if n_diff_input_output > 0:
         #     print(f"[Warning] {n_diff_input_output} output_ids are not the same as the input_ids")
         #outputs = self.tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=True)[0]
         outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
+        print(f"[debug] Raw Outputs: {outputs}")
         outputs = outputs.strip()
 
         if outputs.endswith(self.stop_str):
             outputs = outputs[:-len(self.stop_str)]
         outputs = outputs.strip()
-        
-        print(f"DEBUG (get_outputs): Generated output: '{outputs}'")
 
         return [outputs]
 
@@ -211,8 +285,25 @@ class EvalModelLLAVA(BaseEvalModel):
 
         return conv
 
-    def get_caption_prompt(self, caption=None) -> str:
+    def get_caption_prompt(self, caption=None, language=None) -> str:
         qs = "Provide a short caption for this image."
+
+        translations = {
+            "arabic": "قدّم تعليقًا قصيرًا لهذه الصورة.",
+            "bengali": "এই ছবির জন্য ছোট একটি ক্যাপশন লিখুন।",
+            "chinese": "为这张图片写一段简短的说明。",
+            "english": "Provide a short caption for this image.",
+            "french": "Fournissez une légende courte pour cette image.",
+            "hindi": "इस तस्वीर के लिए एक छोटा कैप्शन लिखें।",
+            "japanese": "この画像の短いキャプションを付けてください。",
+            "russian": "Напишите короткую подпись к этому изображению.",
+            "spanish": "Proporcione un título breve para esta imagen.",
+            "urdu": "اس تصویر کے لیے ایک مختصر تبصرہ دیں۔"
+        }
+        if language:
+            if language in translations:
+                qs = translations[language]
+                print(f"Using language-specific prompt: {qs}")
 
         if self.model.config.mm_use_im_start_end:
             qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + qs
@@ -222,6 +313,24 @@ class EvalModelLLAVA(BaseEvalModel):
         conv = conv_templates[self.conv_mode].copy()
         conv.append_message(conv.roles[0], qs)
         conv.append_message(conv.roles[1], caption)
+
+        return conv
+
+    def get_question_caption_prompt(self, question=None, caption=None) -> str:
+        qs = question
+
+        if self.model.config.mm_use_im_start_end:
+            qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + qs
+        else:
+            qs = DEFAULT_IMAGE_TOKEN + '\n' + qs
+
+        conv = conv_templates[self.conv_mode].copy()
+
+        if self.conv_mode == "plain":
+            conv.append_message("", qs)
+        else:
+            conv.append_message(conv.roles[0], qs)
+            conv.append_message(conv.roles[1], caption)
 
         return conv
 

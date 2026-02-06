@@ -347,3 +347,108 @@ class TensorCaptionDataset(CaptionDataset):
             if self.dataset_name == "coco"
             else self.annotations[idx]["filename"].split(".")[0],
         }
+
+class CaptionDataset_MultiLingual(Dataset):
+    def __init__(
+        self,
+        image_val_dir_path,
+        questions_path,
+        answers_path,
+        dataset_name,
+    ):
+        self.image_val_dir_path = image_val_dir_path
+        self.annotations = []
+        self.dataset_name = dataset_name
+
+
+        questions = {}
+        with open(questions_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:  # Skip empty lines
+                    data = json.loads(line)
+                    questions[data["question_id"]] = data
+
+        self.questions = questions
+        answers = {}
+        with open(answers_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    data = json.loads(line)
+                    answers[data["question_id"]] = data
+
+        full_annotations = []
+
+        for key, value in questions.items():
+
+            question_id = key
+            question_text = value["text"]
+            question_category = value["category"]
+            filename = value["image"]
+            image_id = filename.split(".")[0]
+
+            answer_id = answers[key]["question_id"]
+            answer_text = answers[key]["text"]
+
+            info = {
+                "image_id": image_id,
+                "question_id": question_id,
+                "question_text": question_text,
+                "question_category": question_category,
+                "filename": filename,
+                "answer_id": answer_id,
+                "answer_text": answer_text,
+                        }
+            full_annotations.append(info)
+
+        self.annotations = full_annotations
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, idx):
+        image_path = os.path.join(self.image_val_dir_path, self.annotations[idx]["filename"])
+        image = Image.open(image_path)
+        image.load()
+
+        question_id = self.annotations[idx]["question_id"]
+        image_id = self.annotations[idx]["image_id"]
+
+        question_caption = self.annotations[idx]["question_text"]
+        answer_caption = self.annotations[idx]["answer_text"]
+        return {
+            "image": image,
+            "image_id": image_id,
+            "question_id": question_id,
+            "question_caption": question_caption,
+            "caption": answer_caption,
+        }
+
+
+class TensorCaptionDataset_MultiLingual(CaptionDataset_MultiLingual):
+
+    def get_from_id(self, image_id):
+        filename = f"{image_id}.pt"
+        image_path = os.path.join(self.image_val_dir_path, filename)
+        image = torch.load(image_path)
+        return image
+
+
+    def __getitem__(self, idx):
+        image_path = os.path.join(self.image_val_dir_path, self.annotations[idx]["filename"])
+        image_path = image_path.replace("jpg", "pt")
+        image = torch.load(image_path)
+
+        question_id = self.annotations[idx]["question_id"]
+        image_id = self.annotations[idx]["image_id"]
+
+        question_caption = self.annotations[idx]["question_text"]
+        answer_caption = self.annotations[idx]["answer_text"]
+        return {
+            "image": image,
+            "image_id": image_id,
+            "question_id": question_id,
+            "question_caption": question_caption,
+            "caption": answer_caption,
+        }
